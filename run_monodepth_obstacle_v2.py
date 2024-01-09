@@ -1,0 +1,302 @@
+"""Compute depth maps for images in the input folder.
+"""
+import os
+import glob
+import torch
+import cv2
+import argparse
+import math
+import util.io
+import numpy as np
+import matplotlib.pyplot as plt
+from torchvision.transforms import Compose
+from dpt.models import DPTDepthModel
+from dpt.midas_net import MidasNet_large
+from dpt.transforms import Resize, NormalizeImage, PrepareForNet
+from util.misc import visualize_attention
+
+width = 856
+height = 480
+
+
+def visualize_dpt_values(prediction, output_folder_path):
+     # DPT value to percent
+    min_v = np.min(prediction)
+    max_v = np.max(prediction)
+    print("DPT像素值強度:")
+    # print("min: ",min_v)
+    # print("max: ",max_v)
+    
+    normalized_prediction = ((prediction - min_v) / (max_v - min_v) * 255).astype(np.uint8)
+    
+    rows, cols = 3, 3
+    height, width = normalized_prediction.shape
+    block_height, block_width = height // rows, width // cols
+    block_sums = np.zeros((rows, cols))
+    
+    min_sum_value = float('inf')
+    
+    for i in range(rows):
+        for j in range(cols):
+            block = normalized_prediction[i * block_height: (i + 1) * block_height, j * block_width: (j + 1) * block_width]
+            block_sum = np.sum(block)
+            block_sums[i, j] = block_sum
+            print(f"Sum block at ({i}, {j}): {np.sum(block_sum)}")
+            # 更新最小值
+            if block_sum < min_sum_value:
+                min_sum_value = block_sum
+                min_sum_idx = (i, j)
+                
+            cv2.rectangle(
+                normalized_prediction,
+                (j * block_width, i * block_height),
+                ((j + 1) * block_width, (i + 1) * block_height),
+                (255, 0, 0),  # BGR color (red)
+                2  # Thickness of the rectangle
+            )
+    print("Minimum sum block:", min_sum_idx)
+    print("Minimum sum:", min_sum_value)
+    
+    min_block_top_left = (min_sum_idx[1] * block_width, min_sum_idx[0] * block_height)
+    min_block_bottom_right = ((min_sum_idx[1] + 1) * block_width, (min_sum_idx[0] + 1) * block_height)
+    cv2.rectangle(
+        normalized_prediction,
+        min_block_top_left,
+        min_block_bottom_right,
+        (0, 255, 0),  # BGR color (green) for highlighting the minimum sum block
+        2  # Thickness of the rectangle
+    )
+    
+    output_path = os.path.join(output_folder_path, 'visualization_image.png')
+    cv2.imwrite(output_path, normalized_prediction)
+    
+    return normalized_prediction
+
+
+#DPT程式
+def run(input_path, output_path, model_path, model_type="dpt_hybrid", optimize=True):
+    """Run MonoDepthNN to compute depth maps.
+
+    Args:
+        input_path (str): path to input folder
+        output_path (str): path to output folder
+        model_path (str): path to saved model
+    """
+    print("initialize")
+
+    # select device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device: %s" % device)
+
+    # load network
+    if model_type == "dpt_large":  # DPT-Large
+        net_w = net_h = 384
+        model = DPTDepthModel(
+            path=model_path,
+            backbone="vitl16_384",
+            non_negative=True,
+            enable_attention_hooks=False,
+        )
+        normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    elif model_type == "dpt_hybrid":  # DPT-Hybrid
+        net_w = net_h = 384
+        model = DPTDepthModel(
+            path=model_path,
+            backbone="vitb_rn50_384",
+            non_negative=True,
+            enable_attention_hooks=False,
+        )
+        normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    elif model_type == "dpt_hybrid_kitti":
+        net_w = 1216
+        net_h = 352
+
+        model = DPTDepthModel(
+            path=model_path,
+            scale=0.00006016,
+            shift=0.00579,
+            invert=True,
+            backbone="vitb_rn50_384",
+            non_negative=True,
+            enable_attention_hooks=False,
+        )
+
+        normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    elif model_type == "dpt_hybrid_nyu":
+        net_w = 640
+        net_h = 480
+
+        model = DPTDepthModel(
+            path=model_path,
+            scale=0.000305,
+            shift=0.1378,
+            invert=True,
+            backbone="vitb_rn50_384",
+            non_negative=True,
+            enable_attention_hooks=False,
+        )
+
+        normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    elif model_type == "midas_v21":  # Convolutional model
+        net_w = net_h = 384
+
+        model = MidasNet_large(model_path, non_negative=True)
+        normalization = NormalizeImage(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+    else:
+        assert (
+            False
+        ), f"model_type '{model_type}' not implemented, use: --model_type [dpt_large|dpt_hybrid|dpt_hybrid_kitti|dpt_hybrid_nyu|midas_v21]"
+
+    transform = Compose(
+        [
+            Resize(
+                net_w,
+                net_h,
+                resize_target=None,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=32,
+                resize_method="minimal",
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            normalization,
+            PrepareForNet(),
+        ]
+    )
+
+    model.eval()
+
+    if optimize == True and device == torch.device("cuda"):
+        model = model.to(memory_format=torch.channels_last)
+        model = model.half()
+
+    model.to(device)
+
+    # get input
+    img_names = glob.glob(os.path.join(input_path, "*"))
+    num_images = len(img_names)
+
+    # create output folder
+    os.makedirs(output_path, exist_ok=True)
+
+    print("start processing")
+    for ind, img_name in enumerate(img_names):
+        if os.path.isdir(img_name):
+            continue
+
+        print("  processing {} ({}/{})".format(img_name, ind + 1, num_images))
+        # input
+
+        img = util.io.read_image(img_name)
+
+        if args.kitti_crop is True:
+            height, width, _ = img.shape
+            top = height - 352
+            left = (width - 1216) // 2
+            img = img[top : top + 352, left : left + 1216, :]
+
+        img_input = transform({"image": img})["image"]
+
+        # compute
+        with torch.no_grad():
+            sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
+
+            if optimize == True and device == torch.device("cuda"):
+                sample = sample.to(memory_format=torch.channels_last)
+                sample = sample.half()
+
+            prediction = model.forward(sample)
+            prediction = (
+                torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=img.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                .squeeze()
+                .cpu()
+                .numpy()
+            )
+
+            if model_type == "dpt_hybrid_kitti":
+                prediction *= 256
+
+            if model_type == "dpt_hybrid_nyu":
+                prediction *= 1000.0
+
+            output_folder_path = "D:/image_experience/DPT-main/contour_obstacle_v2_output"
+            visualize_dpt_values(prediction, output_folder_path)
+            
+        filename = os.path.join(
+            output_path, os.path.splitext(os.path.basename(img_name))[0]
+        )
+        util.io.write_depth(filename, prediction, bits=2, absolute_depth=args.absolute_depth)
+    
+    print("finished")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-i", "--input_path", default="input", help="folder with input images"
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output_path",
+        default="output_monodepth",
+        help="folder for output images",
+    )
+
+    parser.add_argument(
+        "-m", "--model_weights", default=None, help="path to model weights"
+    )
+
+    parser.add_argument(
+        "-t",
+        "--model_type",
+        default="dpt_hybrid",
+        help="model type [dpt_large|dpt_hybrid|midas_v21]",
+    )
+
+    parser.add_argument("--kitti_crop", dest="kitti_crop", action="store_true")
+    parser.add_argument("--absolute_depth", dest="absolute_depth", action="store_true")
+
+    parser.add_argument("--optimize", dest="optimize", action="store_true")
+    parser.add_argument("--no-optimize", dest="optimize", action="store_false")
+
+    parser.set_defaults(optimize=True)
+    parser.set_defaults(kitti_crop=False)
+    parser.set_defaults(absolute_depth=False)
+
+    args = parser.parse_args()
+
+    default_models = {
+        "midas_v21": "weights/midas_v21-f6b98070.pt",
+        "dpt_large": "weights/dpt_large-midas-2f21e586.pt",
+        "dpt_hybrid": "weights/dpt_hybrid-midas-501f0c75.pt",
+        "dpt_hybrid_kitti": "weights/dpt_hybrid_kitti-cb926ef4.pt",
+        "dpt_hybrid_nyu": "weights/dpt_hybrid_nyu-2ce69ec7.pt",
+    }
+
+    if args.model_weights is None:
+        args.model_weights = default_models[args.model_type]
+
+    # set torch options
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+    
+    # compute depth maps
+    run(
+        args.input_path,
+        args.output_path,
+        args.model_weights,
+        args.model_type,
+        args.optimize,
+    )
+    
+    print('')
+    
+    cv2.destroyAllWindows()
